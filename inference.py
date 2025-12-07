@@ -56,9 +56,24 @@ def run(SDK: StreamSDK, audio_path: str, source_path: str, output_path: str, mor
         SDK.audio2motion_queue.put(aud_feat)
     SDK.close()
 
-    cmd = f'ffmpeg -loglevel error -y -i "{SDK.tmp_output_path}" -i "{audio_path}" -map 0:v -map 1:a -c:v copy -c:a aac "{output_path}"'
-    print(cmd)
-    os.system(cmd)
+    # Use imageio-ffmpeg for cross-platform compatibility (especially Windows)
+    try:
+        import subprocess
+        import imageio_ffmpeg
+        ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        subprocess.run([
+            ffmpeg_exe, '-loglevel', 'error', '-y',
+            '-i', SDK.tmp_output_path,
+            '-i', audio_path,
+            '-map', '0:v', '-map', '1:a',
+            '-c:v', 'copy', '-c:a', 'aac',
+            output_path
+        ], check=True)
+    except Exception as e:
+        # Fallback to system ffmpeg
+        cmd = f'ffmpeg -loglevel error -y -i "{SDK.tmp_output_path}" -i "{audio_path}" -map 0:v -map 1:a -c:v copy -c:a aac "{output_path}"'
+        print(cmd)
+        os.system(cmd)
 
     print(output_path)
 
