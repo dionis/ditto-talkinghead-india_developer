@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from typing import Optional, Dict, Any
 import numpy as np
+import torch
 import logging
 
 logger = logging.getLogger(__name__)
@@ -52,6 +53,14 @@ class DittoSDKWrapper:
             return
             
         try:
+            # Check for GPU support
+            if not torch.cuda.is_available():
+                logger.error("No CUDA-capable GPU found")
+                raise RuntimeError(
+                    "Ditto requires a CUDA-capable GPU to run. "
+                    "Please ensure you have a compatible GPU and PyTorch with CUDA support installed."
+                )
+
             # Add Ditto path to sys.path temporarily
             if str(self.ditto_path) not in sys.path:
                 sys.path.insert(0, str(self.ditto_path))
@@ -61,7 +70,7 @@ class DittoSDKWrapper:
             from stream_pipeline_online import StreamSDK
             
             # Initialize the SDK
-            self._sdk = StreamSDK(self.cfg_pkl, self.data_root)
+            self._sdk = StreamSDK(self.cfg_pkl, self.data_root, start_writer=False)
             self._is_loaded = True
             
             logger.info("Ditto SDK loaded successfully")
@@ -148,7 +157,9 @@ class DittoSDKWrapper:
         
         # This would need to be implemented in the Ditto SDK
         # For now, return a placeholder
-        return self._sdk.decode_f3d_queue if hasattr(self._sdk, 'decode_f3d_queue') else None
+        if hasattr(self._sdk, 'writer_queue'):
+            return self._sdk.writer_queue
+        return None
     
     def close(self) -> None:
         """Close the Ditto SDK and clean up resources."""

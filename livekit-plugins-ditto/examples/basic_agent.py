@@ -7,10 +7,12 @@ with a Ditto talking head avatar.
 
 import asyncio
 import logging
+import os
 from dotenv import load_dotenv
 from livekit import agents
 from livekit.agents.voice import AgentSession, Agent
-from livekit.plugins import openai, silero, deepgram, elevenlabs
+from livekit.plugins import openai, silero, deepgram, elevenlabs, cartesia, google
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 
 # Import the Ditto plugin
 import sys
@@ -45,6 +47,7 @@ async def entrypoint(ctx: agents.JobContext):
     This function is called when a new participant joins the room.
     """
     logger.info(f"Starting agent for room: {ctx.room.name}")
+    await ctx.connect()
     
     try:
         # Create Ditto avatar session
@@ -57,13 +60,48 @@ async def entrypoint(ctx: agents.JobContext):
             cfg_pkl="../checkpoints/ditto_cfg/v0.4_hubert_cfg_pytorch.pkl",
         )
         
-        # Create agent session with STT, LLM, TTS, and VAD
+        # session = AgentSession(
+        #     stt=deepgram.STT(model="nova-2"),
+        #     llm=openai.LLM(model="gpt-4o"),
+        #     tts=avatar_session.wrap_tts(elevenlabs.TTS(voice="Rachel")),
+        #     vad=silero.VAD.load(),
+        # )
+
+        # Example configuration for Cartesia TTS and other models:
+        # Note: Ensure CARTESIA_API_KEY is set in your .env file
+        # cartesia_tts = cartesia.TTS(
+        #     model="sonic-3", 
+        #     voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc",
+        #     api_key=os.getenv("CARTESIA_API_KEY")
+        # )
+        # session = AgentSession(
+        #     stt=deepgram.STT(model="nova-3", language="multi"),
+        #     llm=openai.LLM(model="gpt-4o-mini"),
+        #     tts=avatar_session.wrap_tts(cartesia_tts),
+        #     vad=silero.VAD.load(),
+        #     turn_detection=MultilingualModel(),
+        # )
+
+        # Example configuration for Gemini LLM:
+        # Note: Ensure GOOGLE_API_KEY is set in your .env file
+        cartesia_tts = cartesia.TTS(model="sonic-3", voice="9626c31c-bec5-4cca-baa8-f8ba9e84c8bc", api_key=os.getenv("CARTESIA_API_KEY"))
         session = AgentSession(
-            stt=deepgram.STT(model="nova-2"),
-            llm=openai.LLM(model="gpt-4o"),
-            tts=elevenlabs.TTS(voice="Rachel"),
+            stt=deepgram.STT(model="nova-3", language="multi", api_key=os.getenv("DEEPGRAM_API_KEY")),
+            llm=google.LLM(model="gemini-2.5-flash", api_key=os.getenv("GOOGLE_API_KEY") ),
+            tts=avatar_session.wrap_tts(cartesia_tts),
             vad=silero.VAD.load(),
+            turn_detection=MultilingualModel(),
         )
+
+        # Example configuration for OpenAI LLM:
+        # Note: Ensure OPENAI_API_KEY is set in your .env file
+        # session = AgentSession(
+        #     stt=deepgram.STT(model="nova-3", language="multi", api_key=os.getenv("DEEPGRAM_API_KEY")),
+        #     llm=openai.LLM(model="gpt-4o-mini", api_key=os.getenv("OPENAI_API_KEY")),
+        #     tts=avatar_session.wrap_tts(cartesia_tts),
+        #     vad=silero.VAD.load(),
+        #     turn_detection=MultilingualModel(),
+        # )
         
         # Start avatar session
         logger.info("Starting avatar session...")

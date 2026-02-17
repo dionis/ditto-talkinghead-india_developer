@@ -39,7 +39,7 @@ wav2feat_cfg:
 
 
 class StreamSDK:
-    def __init__(self, cfg_pkl, data_root, **kwargs):
+    def __init__(self, cfg_pkl, data_root, start_writer=True, **kwargs):
 
         [
             avatar_registrar_cfg,
@@ -53,6 +53,7 @@ class StreamSDK:
         ] = parse_cfg(cfg_pkl, data_root, kwargs)
         
         self.default_kwargs = default_kwargs
+        self.start_writer = start_writer
         
         self.avatar_registrar = AvatarRegistrar(**avatar_registrar_cfg)
         self.condition_handler = ConditionHandler(**condition_handler_cfg)
@@ -251,10 +252,13 @@ class StreamSDK:
             threading.Thread(target=self.warp_f3d_worker),
             threading.Thread(target=self.decode_f3d_worker),
             threading.Thread(target=self.putback_worker),
-            threading.Thread(target=self.writer_worker),
         ]
 
+        if self.start_writer:
+            self.thread_list.append(threading.Thread(target=self.writer_worker))
+
         for thread in self.thread_list:
+            thread.daemon = True
             thread.start()
 
     def _get_ctrl_info(self, fid):

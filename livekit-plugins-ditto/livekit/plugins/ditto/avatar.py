@@ -7,15 +7,142 @@ Main class for managing Ditto avatar sessions in LiveKit.
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional, Dict, Any
-from livekit import rtc
-from livekit.agents import utils
+from typing import Optional, Dict, Any, AsyncIterable
+import numpy as np
+from livekit import rtc, agents
+from livekit.agents import utils, tts
 
 from .ditto_sdk import DittoSDKWrapper
 from .video_source import DittoVideoSource
-from .audio_processor import DittoAudioProcessor
 
 logger = logging.getLogger(__name__)
+
+
+class TTSWrapper(tts.TTS):
+    """
+    Wrapper for TTS to intercept audio for Ditto avatar.
+    """
+    def __init__(self, wrapped_tts: tts.TTS, ditto_sdk: DittoSDKWrapper):
+        super().__init__(
+            capabilities=wrapped_tts.capabilities,
+            sample_rate=wrapped_tts.sample_rate,
+            num_channels=wrapped_tts.num_channels,
+        )
+        self._wrapped_tts = wrapped_tts
+        self._ditto_sdk = ditto_sdk
+
+    def synthesize(self, text: str) -> "ChunkedStream":
+        return self._wrapped_tts.synthesize(text)
+
+    def stream(self, **kwargs) -> "SynthesizeStream":
+        conn_options = kwargs.get("conn_options")
+        logger.info(f"TTSWrapper.stream called with conn_options: {conn_options}")
+        wrapped_stream = self._wrapped_tts.stream(**kwargs)
+        return TTSWrapperStream(
+            wrapped_stream, 
+            self._ditto_sdk, 
+            tts=self, 
+            conn_options=conn_options
+        )
+
+
+class TTSWrapperStream(tts.SynthesizeStream):
+    def __init__(
+        self, 
+        wrapped_stream: tts.SynthesizeStream, 
+        ditto_sdk: DittoSDKWrapper,
+        *,
+        tts: tts.TTS,
+        conn_options: Any
+    ):
+        super().__init__(tts=tts, conn_options=conn_options)
+        logger.info("TTSWrapperStream initialized")
+        self._wrapped_stream = wrapped_stream
+        self._ditto_sdk = ditto_sdk
+
+    @property
+    def validation_error(self) -> Optional[str]:
+        return self._wrapped_stream.validation_error
+
+    def push_text(self, token: str | None) -> None:
+        self._wrapped_stream.push_text(token)
+
+    def flush(self) -> None:
+        if asyncio.iscoroutinefunction(self._wrapped_stream.flush):
+            asyncio.create_task(self._wrapped_stream.flush())
+        else:
+            self._wrapped_stream.flush()
+
+    async def aclose(self) -> None:
+        await self._wrapped_stream.aclose()
+        await super().aclose()
+
+    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
+        """
+        Core TTS processing loop. Delegates to the wrapped TTS stream,
+        intercepts audio frames for Ditto, and re-emits them downstream.
+        
+        The LiveKit framework calls this method to drive TTS synthesis.
+        Without a working implementation here, no audio is ever generated.
+        """
+        request_id = utils.shortuuid()
+        
+        # Initialize the output emitter with the audio format
+        output_emitter.initialize(
+            request_id=request_id,
+            sample_rate=self._tts.sample_rate,
+            num_channels=self._tts.num_channels,
+            mime_type="audio/pcm",
+            stream=True,
+        )
+        
+        segment_id = utils.shortuuid()
+        output_emitter.start_segment(segment_id=segment_id)
+        
+        logger.info(f"TTSWrapperStream._run started (request_id={request_id})")
+        
+        try:
+            # Iterate over the wrapped stream's output
+            # The wrapped stream (e.g. Cartesia, ElevenLabs) has its own _run() 
+            # that is triggered when we iterate over it via __aiter__
+            async for synthesized_audio in self._wrapped_stream:
+                frame = synthesized_audio.frame
+                
+                # 1. Re-emit audio downstream so LiveKit plays it to the user
+                audio_bytes = frame.data.tobytes()
+                output_emitter.push(audio_bytes)
+                
+                # 2. Intercept audio and feed to Ditto for avatar animation
+                if self._ditto_sdk.is_loaded:
+                    try:
+                        # Convert PCM16 audio to float32 for Ditto
+                        # TTS typically outputs PCM16 (int16)
+                        audio_data = np.frombuffer(audio_bytes, dtype=np.int16)
+                        audio_float = audio_data.astype(np.float32) / 32768.0
+                        
+                        # Resample to 16kHz if needed (Ditto expects 16kHz mono)
+                        # Most TTS outputs at higher sample rates (22050, 24000, etc)
+                        tts_sample_rate = self._tts.sample_rate
+                        if tts_sample_rate != 16000:
+                            # Simple resampling using numpy interpolation
+                            target_len = int(len(audio_float) * 16000 / tts_sample_rate)
+                            if target_len > 0:
+                                indices = np.linspace(0, len(audio_float) - 1, target_len)
+                                audio_float = np.interp(indices, np.arange(len(audio_float)), audio_float).astype(np.float32)
+                        
+                        self._ditto_sdk.process_audio_chunk(audio_float)
+                        logger.debug(f"Fed {len(audio_float)} samples to Ditto")
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing audio for Ditto: {e}")
+            
+            # Signal end of audio
+            output_emitter.flush()
+            logger.info("TTSWrapperStream._run completed")
+            
+        except Exception as e:
+            logger.error(f"Error in TTSWrapperStream._run: {e}")
+            raise
 
 
 class DittoAvatarSession:
@@ -70,11 +197,6 @@ class DittoAvatarSession:
             fps=video_fps,
         )
         
-        self.audio_processor = DittoAudioProcessor(
-            target_sample_rate=16000,
-            chunk_size_ms=audio_chunk_ms,
-        )
-        
         # State
         self._room: Optional[rtc.Room] = None
         self._agent_session = None
@@ -85,6 +207,12 @@ class DittoAvatarSession:
             f"Initialized DittoAvatarSession: {avatar_participant_identity}, "
             f"image={source_image}"
         )
+
+    def wrap_tts(self, tts_instance: tts.TTS) -> tts.TTS:
+        """
+        Wrap a TTS instance to capture generated audio for the avatar.
+        """
+        return TTSWrapper(tts_instance, self.ditto_sdk)
     
     async def start(
         self,
@@ -137,9 +265,9 @@ class DittoAvatarSession:
             self._is_running = True
             self.video_source.start_publishing()
             
-            # Start audio processing task
+            # Start video frame processing task
             self._tasks.append(
-                asyncio.create_task(self._audio_processing_loop())
+                asyncio.create_task(self._process_frame_loop())
             )
             
             logger.info("Ditto avatar session started successfully")
@@ -149,67 +277,44 @@ class DittoAvatarSession:
             await self.stop()
             raise
     
-    async def _audio_processing_loop(self) -> None:
+    async def _process_frame_loop(self) -> None:
         """
-        Main loop for processing audio and generating video frames.
+        Loop for retrieving generated video frames from Ditto and publishing them.
         """
-        logger.info("Starting audio processing loop")
+        logger.info("Starting frame processing loop")
         
         try:
-            # Get audio stream from agent session
-            # Note: This is a simplified version - actual implementation
-            # would need to subscribe to the agent's audio output
-            audio_stream = self._get_agent_audio_stream()
-            
-            async for audio_chunk in self.audio_processor.stream_audio_chunks(audio_stream):
-                if not self._is_running:
-                    break
-                
-                # Process audio chunk with Ditto
-                self.ditto_sdk.process_audio_chunk(audio_chunk)
-                
-                # Get generated frames (this is a placeholder)
-                # In reality, you'd need to implement frame retrieval from Ditto
-                frames = await self._get_generated_frames()
-                
-                if frames:
-                    # Publish frames
-                    for frame in frames:
-                        await self.video_source.publish_frame(frame)
+            frame_queue = self.ditto_sdk.get_frame_queue()
+            if frame_queue is None:
+                logger.error("Could not get frame queue from Ditto SDK")
+                return
+
+            logger.info("Frame queue retrieved, entering loop")
+            while self._is_running:
+                # Use asyncio.to_thread for blocking queue.get
+                try:
+                    # Get frame from queue (blocking)
+                    # We run this in a thread to verify async loop isn't blocked
+                    # logger.debug("Waiting for frame...")
+                    frame = await asyncio.to_thread(frame_queue.get, timeout=0.1)
+                    
+                    if frame is None:
+                        continue
+                        
+                    # logger.debug("Got frame, publishing...")
+                    # Publish frame
+                    await self.video_source.publish_frame(frame)
+                    
+                except Exception:
+                    # Queue empty or timeout, just continue
+                    # Add a small sleep to prevent tight loop if queue.get is not blocking well
+                    await asyncio.sleep(0.001) 
+                    continue
                 
         except Exception as e:
-            logger.error(f"Error in audio processing loop: {e}")
+            logger.error(f"Error in frame processing loop: {e}")
         finally:
-            logger.info("Audio processing loop ended")
-    
-    def _get_agent_audio_stream(self):
-        """
-        Get audio stream from agent session.
-        
-        This is a placeholder - actual implementation would depend on
-        how the AgentSession exposes its audio output.
-        """
-        # TODO: Implement actual audio stream subscription
-        # This might look like:
-        # return self._agent_session.audio_output_stream()
-        raise NotImplementedError(
-            "Audio stream subscription needs to be implemented based on "
-            "LiveKit AgentSession API"
-        )
-    
-    async def _get_generated_frames(self):
-        """
-        Get generated video frames from Ditto SDK.
-        
-        This is a placeholder - actual implementation would need to
-        retrieve frames from Ditto's processing pipeline.
-        """
-        # TODO: Implement frame retrieval from Ditto SDK
-        # This might involve:
-        # - Accessing Ditto's frame queue
-        # - Converting frames to numpy arrays
-        # - Handling synchronization
-        return []
+            logger.info("Frame processing loop ended")
     
     async def stop(self) -> None:
         """Stop the avatar session and clean up resources."""
